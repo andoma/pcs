@@ -515,3 +515,10 @@ pcs_poll(uint8_t *buf, size_t max_bytes, int64_t clock)
   pthread_mutex_unlock(&pcs_mutex);
   return 0;
 }
+
+
+void * __attribute__((weak))
+pcs_accept(pcs_t *pcs, uint8_t channel)
+{
+  return NULL;
+}
