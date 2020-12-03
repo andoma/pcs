@@ -232,8 +232,10 @@ pcs_input_locked(const uint8_t *data, size_t len, int64_t now)
     break;
 
   case PCS_STATE_SYNACK:
+    if(pcs_accept(pcs, pcs->channel)) {
+      return;
+    }
     pcs->state = PCS_STATE_EST;
-    pcs_accept(pcs, pcs->channel);
     pcs->last_output = 0;
     break;
 

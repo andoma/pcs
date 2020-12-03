@@ -8,7 +8,8 @@
 typedef struct pcs pcs_t;
 
 
-void *pcs_accept(pcs_t *pcs, uint8_t channel);
+// Return 0 to accept, any other to terminate connection
+int pcs_accept(pcs_t *pcs, uint8_t channel);
 
 void pcs_input(const uint8_t *data, size_t len, int64_t clock);
 
