@@ -377,7 +377,7 @@ pcs_connect(uint8_t channel, int64_t now)
 
 
 int
-pcs_read(pcs_t *pcs, void *data, size_t len, int all)
+pcs_read(pcs_t *pcs, void *data, size_t len, int wait)
 {
   uint8_t *d = data;
   int total = 0;
@@ -385,30 +385,22 @@ pcs_read(pcs_t *pcs, void *data, size_t len, int all)
 
   pthread_mutex_lock(&pcs_mutex);
 
-  while(1) {
+  while(len) {
 
     assert(pcs->state != PCS_STATE_CLOSED &&
            pcs->state != PCS_STATE_LINGER);
 
-    if(all) {
-      if(len == 0)
-        break;
-    } else {
-      if(total > 0)
-        break;
-    }
-
     const uint16_t avail = pcs->rxfifo_wrptr - pcs->rxfifo_rdptr;
     if(!avail) {
 
-      if(pcs->state == PCS_STATE_FIN) {
-        total = 0;
-        break;
-      }
       if(pcs->state == PCS_STATE_ERR) {
         total = -1;
         break;
       }
+
+      if(!wait || pcs->state == PCS_STATE_FIN)
+        break;
+
       pthread_cond_wait(&pcs->rxfifo_cond, &pcs_mutex);
       continue;
     }
@@ -519,8 +511,8 @@ pcs_poll(uint8_t *buf, size_t max_bytes, int64_t clock)
 }
 
 
-void * __attribute__((weak))
+int __attribute__((weak))
 pcs_accept(pcs_t *pcs, uint8_t channel)
 {
-  return NULL;
+  return -1;
 }
