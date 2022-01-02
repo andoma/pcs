@@ -99,8 +99,10 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
   buf[size++] = pcs->txfifo_sent;
 
   const int max_payload = max_bytes - size;
-  if(max_payload < 0)
+  if(max_payload < 0) {
+    buf[1] = flags;
     return size;
+  }
 
   int payload_len = 0;
 
