@@ -53,6 +53,8 @@ struct pcs {
   uint8_t flow;
   uint8_t pending_send_flags;
 
+  uint16_t transport_addr;
+
   uint16_t txfifo_size;
 
   uint16_t txfifo_acked;
@@ -131,11 +133,18 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
   return size;
 }
 
+static void
+pcs_wakeup(pcs_t *pcs)
+{
+  pcs_iface_t *pi = pcs->iface;
+  if(pi->pi_wakeup != NULL)
+    pi->pi_wakeup(pi->pi_opaque);
+}
 
 
 static pcs_t *
 pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
-           int state)
+           int state, uint16_t transport_addr)
 {
   pcs_t *pcs = malloc(sizeof(pcs_t) + fifo_size * 2);
   if(pcs == NULL)
@@ -144,6 +153,7 @@ pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
   memset(pcs, 0, sizeof(pcs_t));
   pcs->iface = pi;
   pcs->channel = channel;
+  pcs->transport_addr = transport_addr;
   pcs->txfifo_size = fifo_size;
   pcs->rxfifo_size = fifo_size;
 
@@ -159,16 +169,8 @@ pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
   TAILQ_INSERT_HEAD(&pi->pi_pcss, pcs, link);
   pcs->last_input = now;
   pcs->rtx = 50000;
+  pcs_wakeup(pcs);
   return pcs;
-}
-
-
-static void
-pcs_wakeup(pcs_t *pcs)
-{
-  pcs_iface_t *pi = pcs->iface;
-  if(pi->pi_wakeup != NULL)
-    pi->pi_wakeup(pi->pi_opaque);
 }
 
 
@@ -206,7 +208,8 @@ accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
 
 
 static void
-pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now)
+pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
+                 uint16_t addr)
 {
   if(len < 5)
     return;
@@ -233,7 +236,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now)
     }
     if(len != 2)
       return;
-    pcs = pcs_create(pi, channel, 64, now, PCS_STATE_SYNACK);
+    pcs = pcs_create(pi, channel, 64, now, PCS_STATE_SYNACK, addr);
     if(pcs == NULL)
       return;
     pcs->flow = flow;
@@ -323,10 +326,11 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now)
 
 
 void
-pcs_input(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now)
+pcs_input(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
+          uint16_t addr)
 {
   pthread_mutex_lock(&pi->pi_mutex);
-  pcs_input_locked(pi, data, len, now);
+  pcs_input_locked(pi, data, len, now, addr);
   pthread_mutex_unlock(&pi->pi_mutex);
 }
 
@@ -399,10 +403,10 @@ pcs_close(pcs_t *pcs)
 
 
 pcs_t *
-pcs_connect(pcs_iface_t *pi, uint8_t channel, int64_t now)
+pcs_connect(pcs_iface_t *pi, uint8_t channel, int64_t now, uint16_t addr)
 {
   pthread_mutex_lock(&pi->pi_mutex);
-  pcs_t *pcs = pcs_create(pi, channel, 64, now, PCS_STATE_SYN);
+  pcs_t *pcs = pcs_create(pi, channel, 64, now, PCS_STATE_SYN, addr);
   pthread_mutex_unlock(&pi->pi_mutex);
   return pcs;
 }
@@ -468,17 +472,18 @@ pcs_destroy(pcs_iface_t *pi, pcs_t *pcs)
   free(pcs);
 }
 
-size_t
+pcs_poll_result_t
 pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
 {
   if(max_bytes < MAX_HEADER_LEN)
-    return 0;
+    return (pcs_poll_result_t){};
 
   if(pthread_mutex_trylock(&pi->pi_mutex))
-    return 0;
+    return (pcs_poll_result_t){};
 
   pcs_t *pcs, *n;
   for(pcs = TAILQ_FIRST(&pi->pi_pcss); pcs != NULL; pcs = n) {
+
     n = TAILQ_NEXT(pcs, link);
 
     switch(pcs->state) {
@@ -532,15 +537,16 @@ pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
 
     size_t r = pcs_xmit(pcs, buf, max_bytes);
     if(r) {
+      pcs_poll_result_t ppr = {.len = r, .addr = pcs->transport_addr};
       pcs->last_output = clock;
       TAILQ_REMOVE(&pi->pi_pcss, pcs, link);
       TAILQ_INSERT_TAIL(&pi->pi_pcss, pcs, link);
       pthread_mutex_unlock(&pi->pi_mutex);
-      return r;
+      return ppr;
     }
   }
   pthread_mutex_unlock(&pi->pi_mutex);
-  return 0;
+  return (pcs_poll_result_t){};
 }
 
 pcs_iface_t *
