@@ -180,7 +180,6 @@ accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
   if(seq != pcs->rxfifo_wrptr) {
     // Got data which does not point to our fifo buffers start,
     pcs->pending_send_flags |= (PCS_F_LOSS | PCS_F_ACK);
-    pcs_wakeup(pcs);
     return;
   }
 
@@ -201,7 +200,6 @@ accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
   pthread_cond_signal(&pcs->rxfifo_cond);
 
   pcs->pending_send_flags |= PCS_F_ACK;
-  pcs_wakeup(pcs);
 }
 
 
@@ -284,7 +282,6 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
   case PCS_STATE_LINGER:
     pcs->last_output = 0;
-    pcs_wakeup(pcs);
     return;
 
   case PCS_STATE_ERR:
@@ -313,6 +310,11 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     data += 2;
     len -= 2;
     accept_data(pcs, data, len, seq);
+
+    if(len || !(in_flags & PCS_F_ACK)) {
+      pcs_wakeup(pcs);
+      pcs->last_output = 0;
+    }
 
     if(in_flags & PCS_F_EOS) {
       uint16_t the_end = seq + len;
