@@ -241,6 +241,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
       return;
     pcs->flow = flow;
     pcs->rxfifo_wrptr = pcs->rxfifo_rdptr = (data[0] << 8) | data[1];
+    pcs_wakeup(pcs);
     return;
   }
 
@@ -364,6 +365,8 @@ pcs_send(pcs_t *pcs, const void *data, size_t len, int flush)
     }
 
     pcs->txfifo_wrptr = wrptr;
+
+    pcs_wakeup(pcs);
 
     data += to_copy;
     len -= to_copy;
