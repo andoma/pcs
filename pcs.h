@@ -30,7 +30,8 @@ typedef struct {
 } pcs_poll_result_t;
 
 pcs_poll_result_t pcs_poll(pcs_iface_t *pi, uint8_t *buf,
-                           size_t max_bytes, int64_t clock);
+                           size_t max_bytes, int64_t clock,
+                           int64_t *next_clock);
 
 pcs_iface_t *pcs_iface_create(void *opaque,
                               int (*accept)(void *opaque, pcs_t *pcs,

@@ -476,13 +476,16 @@ pcs_destroy(pcs_iface_t *pi, pcs_t *pcs)
 }
 
 pcs_poll_result_t
-pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
+pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
+         int64_t *nextp)
 {
-  if(max_bytes < MAX_HEADER_LEN)
+  if(max_bytes < MAX_HEADER_LEN || pthread_mutex_trylock(&pi->pi_mutex)) {
+    if(nextp)
+      *nextp = clock + 10000;
     return (pcs_poll_result_t){};
+  }
 
-  if(pthread_mutex_trylock(&pi->pi_mutex))
-    return (pcs_poll_result_t){};
+  int64_t next = INT64_MAX;
 
   pcs_t *pcs, *n;
   for(pcs = TAILQ_FIRST(&pi->pi_pcss); pcs != NULL; pcs = n) {
@@ -496,6 +499,7 @@ pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
         pcs_backoff(pcs);
         break;
       }
+      next = MIN(next, pcs->last_output + pcs->rtx);
       continue;
 
     case PCS_STATE_EST:
@@ -504,6 +508,8 @@ pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
       if(clock > pcs->last_output + 1500000)
         break;
 
+      next = MIN(next, pcs->last_output + 1500000);
+
       if(pcs->txfifo_sent != pcs->txfifo_wrptr)
         break;
 
@@ -511,10 +517,13 @@ pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
         break;
 
       if((pcs->txfifo_acked != pcs->txfifo_wrptr ||
-          pcs->pending_send_flags & PCS_F_EOS) &&
-         clock > pcs->last_output + pcs->rtx) {
-        pcs_backoff(pcs);
-        break;
+          pcs->pending_send_flags & PCS_F_EOS)) {
+
+        if(clock > pcs->last_output + pcs->rtx) {
+          pcs_backoff(pcs);
+          break;
+        }
+        next = MIN(next, pcs->last_output + pcs->rtx);
       }
       continue;
 
@@ -549,6 +558,8 @@ pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
     }
   }
   pthread_mutex_unlock(&pi->pi_mutex);
+  if(nextp)
+    *nextp = next;
   return (pcs_poll_result_t){};
 }
 
