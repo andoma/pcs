@@ -319,7 +319,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     if(in_flags & PCS_F_EOS) {
       uint16_t the_end = seq + len;
       if(pcs->rxfifo_wrptr == the_end) {
-        assert(pcs->state == PCS_STATE_EST);
+        assert(pcs->state <= PCS_STATE_FIN);
         pcs->state = PCS_STATE_FIN;
         pthread_cond_signal(&pcs->rxfifo_cond);
       }
@@ -383,6 +383,7 @@ pcs_shutdown_locked(pcs_t *pcs)
 {
   pcs->txfifo_eos = pcs->txfifo_wrptr;
   pcs->pending_send_flags |= PCS_F_EOS;
+  pcs_wakeup(pcs);
 }
 
 
