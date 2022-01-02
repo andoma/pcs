@@ -413,7 +413,7 @@ pcs_connect(pcs_iface_t *pi, uint8_t channel, int64_t now, uint16_t addr)
 
 
 int
-pcs_read(pcs_t *pcs, void *data, size_t len, int wait)
+pcs_read(pcs_t *pcs, void *data, size_t len, size_t req)
 {
   pcs_iface_t *pi = pcs->iface;
   uint8_t *d = data;
@@ -435,7 +435,7 @@ pcs_read(pcs_t *pcs, void *data, size_t len, int wait)
         break;
       }
 
-      if(!wait || pcs->state == PCS_STATE_FIN)
+      if(total >= req || pcs->state == PCS_STATE_FIN)
         break;
 
       pthread_cond_wait(&pcs->rxfifo_cond, &pi->pi_mutex);

@@ -18,7 +18,7 @@ int pcs_send(pcs_t *pcs, const void *data, size_t len,
 pcs_t *pcs_connect(pcs_iface_t *pi, uint8_t channel, int64_t clock,
                    uint16_t addr);
 
-int pcs_read(pcs_t *pcs, void *data, size_t len, int wait);
+int pcs_read(pcs_t *pcs, void *data, size_t len, size_t req_len);
 
 void pcs_close(pcs_t *pcs);
 
