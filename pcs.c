@@ -1,14 +1,12 @@
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <stdint.h>
 #include <sys/queue.h>
 #include <sys/param.h>
 #include <pthread.h>
 
 #include "pcs.h"
-
 
 // Packetized Character Stream
 
@@ -19,7 +17,8 @@ struct pcs_iface {
   struct pcs_queue pi_pcss;
   void *pi_opaque;
   int (*pi_accept)(void *opauqe, pcs_t *pcs, uint8_t channel);
-  void (*pi_wakeup)(void *opaque);
+  int pi_fifo_size;
+  pthread_cond_t pi_cond;
 };
 
 #define PCS_STATE_EST    0
@@ -30,11 +29,11 @@ struct pcs_iface {
 #define PCS_STATE_SYN    5
 #define PCS_STATE_SYNACK 6
 
-// Flags < bit 8 are propagated to the remote via the hdr[0] byte
 #define PCS_F_SYN   0x1
 #define PCS_F_LOSS  0x2
 #define PCS_F_EOS   0x4
-#define PCS_F_ACK   0x8
+#define PCS_F_IAK   0x8  // Request Immediate ACK
+#define PCS_F_ACK   0x10
 
 struct pcs {
   int64_t last_output;
@@ -52,6 +51,7 @@ struct pcs {
   uint8_t channel;
   uint8_t flow;
   uint8_t pending_send_flags;
+  uint8_t tentative_flows;
 
   uint16_t transport_addr;
 
@@ -81,7 +81,7 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
 
   uint8_t flags = pcs->pending_send_flags;
 
-  pcs->pending_send_flags &= ~(PCS_F_LOSS | PCS_F_ACK);
+  pcs->pending_send_flags &= ~(PCS_F_LOSS | PCS_F_ACK | PCS_F_IAK);
 
   if(pcs->state == PCS_STATE_SYN) {
     pcs->flow = rand();
@@ -133,12 +133,19 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
   return size;
 }
 
-static void
-pcs_wakeup(pcs_t *pcs)
+
+void
+pcs_flush(pcs_t *pcs)
 {
   pcs_iface_t *pi = pcs->iface;
-  if(pi->pi_wakeup != NULL)
-    pi->pi_wakeup(pi->pi_opaque);
+  pthread_cond_signal(&pi->pi_cond);
+}
+
+
+__attribute__((weak))
+void *pcs_malloc(size_t size)
+{
+  return malloc(size);
 }
 
 
@@ -146,7 +153,7 @@ static pcs_t *
 pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
            int state, uint16_t transport_addr)
 {
-  pcs_t *pcs = malloc(sizeof(pcs_t) + fifo_size * 2);
+  pcs_t *pcs = pcs_malloc(sizeof(pcs_t) + fifo_size * 2);
   if(pcs == NULL)
     return NULL;
 
@@ -169,7 +176,7 @@ pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
   TAILQ_INSERT_HEAD(&pi->pi_pcss, pcs, link);
   pcs->last_input = now;
   pcs->rtx = 50000;
-  pcs_wakeup(pcs);
+  pcs_flush(pcs);
   return pcs;
 }
 
@@ -198,11 +205,30 @@ accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
   }
   pcs->rxfifo_wrptr = wrptr;
   pthread_cond_signal(&pcs->rxfifo_cond);
-
-  pcs->pending_send_flags |= PCS_F_ACK;
 }
 
 
+static void
+pcs_shutdown_locked(pcs_t *pcs)
+{
+  pcs->txfifo_eos = pcs->txfifo_wrptr;
+  pcs->pending_send_flags |= PCS_F_EOS;
+  pcs_flush(pcs);
+}
+
+
+static int
+half_open_count(const pcs_iface_t *pi)
+{
+  const pcs_t *pcs;
+  int count = 0;
+  TAILQ_FOREACH(pcs, &pi->pi_pcss, link) {
+    if(pcs->state == PCS_STATE_SYNACK ||
+       pcs->state == PCS_STATE_CLOSED)
+      count++;
+  }
+  return count;
+}
 
 
 static void
@@ -234,12 +260,16 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     }
     if(len != 2)
       return;
-    pcs = pcs_create(pi, channel, 64, now, PCS_STATE_SYNACK, addr);
+
+    if(half_open_count(pi) > 1)
+      return;
+
+    pcs = pcs_create(pi, channel, pi->pi_fifo_size, now, PCS_STATE_SYNACK, addr);
     if(pcs == NULL)
       return;
     pcs->flow = flow;
     pcs->rxfifo_wrptr = pcs->rxfifo_rdptr = (data[0] << 8) | data[1];
-    pcs_wakeup(pcs);
+    pcs_flush(pcs);
     return;
   }
 
@@ -257,16 +287,18 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     pcs->rxfifo_wrptr = pcs->rxfifo_rdptr = (data[0] << 8) | data[1];
     pcs->state = PCS_STATE_EST;
     pcs->last_output = 0;
-    pcs_wakeup(pcs);
+    pcs_flush(pcs);
     break;
 
   case PCS_STATE_SYNACK:
     if(pi->pi_accept(pi->pi_opaque, pcs, pcs->channel)) {
+      pcs_shutdown_locked(pcs);
+      pcs->state = PCS_STATE_CLOSED;
       return;
     }
     pcs->state = PCS_STATE_EST;
     pcs->last_output = 0;
-    pcs_wakeup(pcs);
+    pcs_flush(pcs);
     break;
 
   case PCS_STATE_CLOSED:
@@ -282,6 +314,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
   case PCS_STATE_LINGER:
     pcs->last_output = 0;
+    pcs_flush(pcs);
     return;
 
   case PCS_STATE_ERR:
@@ -293,7 +326,11 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
   if(ackd_delta >= 0 && wr_delta <= 0) {
     pcs->txfifo_acked = ack;
-    pthread_cond_signal(&pcs->txfifo_cond);
+
+    const uint16_t full = pcs->txfifo_wrptr - pcs->txfifo_acked;
+    if(full < pcs->txfifo_size / 2) {
+      pthread_cond_signal(&pcs->txfifo_cond);
+    }
 
     if(in_flags & PCS_F_LOSS) {
       pcs->txfifo_sent = ack;
@@ -311,9 +348,9 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     len -= 2;
     accept_data(pcs, data, len, seq);
 
-    if(len || !(in_flags & PCS_F_ACK)) {
-      pcs_wakeup(pcs);
-      pcs->last_output = 0;
+    if(in_flags & PCS_F_IAK) {
+      pcs->pending_send_flags |= PCS_F_ACK;
+      pcs_flush(pcs);
     }
 
     if(in_flags & PCS_F_EOS) {
@@ -339,7 +376,7 @@ pcs_input(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
 
 int
-pcs_send(pcs_t *pcs, const void *data, size_t len, int flush)
+pcs_send(pcs_t *pcs, const void *data, size_t len)
 {
   pcs_iface_t *pi = pcs->iface;
   uint8_t *txfifo = pcs->buffers + pcs->rxfifo_size;
@@ -354,12 +391,14 @@ pcs_send(pcs_t *pcs, const void *data, size_t len, int flush)
     }
     uint16_t avail = pcs->txfifo_size - (pcs->txfifo_wrptr - pcs->txfifo_acked);
     if(avail == 0) {
+      pcs_flush(pcs);
       pthread_cond_wait(&pcs->txfifo_cond, &pi->pi_mutex);
       continue;
     }
 
     const uint16_t mask = pcs->txfifo_size - 1;
     const int to_copy = MIN(avail, len);
+    assert(to_copy > 0 && to_copy < pcs->txfifo_size);
     uint16_t wrptr = pcs->txfifo_wrptr;
     const uint8_t *d = data;
     for(int i = 0; i < to_copy; i++) {
@@ -367,9 +406,6 @@ pcs_send(pcs_t *pcs, const void *data, size_t len, int flush)
     }
 
     pcs->txfifo_wrptr = wrptr;
-
-    pcs_wakeup(pcs);
-
     data += to_copy;
     len -= to_copy;
   }
@@ -378,13 +414,6 @@ pcs_send(pcs_t *pcs, const void *data, size_t len, int flush)
 }
 
 
-static void
-pcs_shutdown_locked(pcs_t *pcs)
-{
-  pcs->txfifo_eos = pcs->txfifo_wrptr;
-  pcs->pending_send_flags |= PCS_F_EOS;
-  pcs_wakeup(pcs);
-}
 
 
 
@@ -478,105 +507,140 @@ pcs_destroy(pcs_iface_t *pi, pcs_t *pcs)
   free(pcs);
 }
 
+
+__attribute__((always_inline)) static inline
 pcs_poll_result_t
-pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
-         int64_t *nextp)
+pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
+         int64_t (*wait)(pthread_cond_t *c,
+                         pthread_mutex_t *m,
+                         int64_t deadline))
 {
-  if(max_bytes < MAX_HEADER_LEN || pthread_mutex_trylock(&pi->pi_mutex)) {
-    if(nextp)
-      *nextp = clock + 10000;
-    return (pcs_poll_result_t){};
-  }
+  while(1) {
+    int64_t next = INT64_MAX;
 
-  int64_t next = INT64_MAX;
+    pcs_t *pcs, *n;
+    for(pcs = TAILQ_FIRST(&pi->pi_pcss); pcs != NULL; pcs = n) {
 
-  pcs_t *pcs, *n;
-  for(pcs = TAILQ_FIRST(&pi->pi_pcss); pcs != NULL; pcs = n) {
-
-    n = TAILQ_NEXT(pcs, link);
-
-    switch(pcs->state) {
-    case PCS_STATE_SYN:
-    case PCS_STATE_SYNACK:
-      if(clock > pcs->last_output + pcs->rtx) {
-        pcs_backoff(pcs);
-        break;
-      }
-      next = MIN(next, pcs->last_output + pcs->rtx);
-      continue;
-
-    case PCS_STATE_EST:
-    case PCS_STATE_FIN:
-    case PCS_STATE_CLOSED:
-      if(clock > pcs->last_output + 1500000)
-        break;
-
-      next = MIN(next, pcs->last_output + 1500000);
-
-      if(pcs->txfifo_sent != pcs->txfifo_wrptr)
-        break;
-
-      if(pcs->pending_send_flags & PCS_F_ACK)
-        break;
-
-      if((pcs->txfifo_acked != pcs->txfifo_wrptr ||
-          pcs->pending_send_flags & PCS_F_EOS)) {
-
+      n = TAILQ_NEXT(pcs, link);
+      switch(pcs->state) {
+      case PCS_STATE_SYN:
+      case PCS_STATE_SYNACK:
         if(clock > pcs->last_output + pcs->rtx) {
+          pcs->pending_send_flags |= PCS_F_IAK;
           pcs_backoff(pcs);
           break;
         }
         next = MIN(next, pcs->last_output + pcs->rtx);
+        continue;
+
+      case PCS_STATE_EST:
+      case PCS_STATE_FIN:
+      case PCS_STATE_CLOSED:
+        if(clock > pcs->last_output + 1500000)
+          break;
+
+        next = MIN(next, pcs->last_output + 1500000);
+        uint16_t unacked = pcs->txfifo_sent - pcs->txfifo_acked;
+        if(unacked) {
+          pcs->pending_send_flags |= PCS_F_IAK;
+        }
+
+        if(pcs->txfifo_sent != pcs->txfifo_wrptr) {
+          break;
+        }
+
+        if(pcs->pending_send_flags & PCS_F_ACK) {
+          break;
+        }
+
+        if(unacked || (pcs->pending_send_flags & PCS_F_EOS)) {
+
+          if(clock > pcs->last_output + pcs->rtx) {
+            pcs_backoff(pcs);
+            break;
+          }
+          next = MIN(next, pcs->last_output + pcs->rtx);
+        }
+        continue;
+
+      case PCS_STATE_ERR:
+        continue;
+
+      case PCS_STATE_LINGER:
+        if(clock > pcs->last_input + 5000000) {
+          pcs_destroy(pi, pcs);
+          continue;
+        }
+        if(pcs->last_output)
+          continue;
+        break;
       }
-      continue;
 
-    case PCS_STATE_ERR:
-      continue;
-
-    case PCS_STATE_LINGER:
+      next = MIN(next, pcs->last_input + 5000000);
       if(clock > pcs->last_input + 5000000) {
-        pcs_destroy(pi, pcs);
+        if(pcs->state == PCS_STATE_CLOSED) {
+          pcs->state = PCS_STATE_LINGER;
+        } else {
+          pcs->state = PCS_STATE_ERR;
+        }
+        pthread_cond_signal(&pcs->rxfifo_cond);
+        pthread_cond_signal(&pcs->txfifo_cond);
         continue;
       }
-      if(pcs->last_output)
-        continue;
-      break;
+
+      size_t r = pcs_xmit(pcs, buf, max_bytes);
+      if(r) {
+        pcs_poll_result_t ppr = {.len = r, .addr = pcs->transport_addr};
+        pcs->last_output = clock;
+        TAILQ_REMOVE(&pi->pi_pcss, pcs, link);
+        TAILQ_INSERT_TAIL(&pi->pi_pcss, pcs, link);
+        return ppr;
+      }
     }
 
-    if(clock > pcs->last_input + 5000000) {
-      pcs->state = PCS_STATE_ERR;
-      pthread_cond_signal(&pcs->rxfifo_cond);
-      pthread_cond_signal(&pcs->txfifo_cond);
-      continue;
-    }
-
-    size_t r = pcs_xmit(pcs, buf, max_bytes);
-    if(r) {
-      pcs_poll_result_t ppr = {.len = r, .addr = pcs->transport_addr};
-      pcs->last_output = clock;
-      TAILQ_REMOVE(&pi->pi_pcss, pcs, link);
-      TAILQ_INSERT_TAIL(&pi->pi_pcss, pcs, link);
-      pthread_mutex_unlock(&pi->pi_mutex);
-      return ppr;
-    }
+    if(wait == NULL)
+      return (pcs_poll_result_t){};
+    clock = wait(&pi->pi_cond, &pi->pi_mutex, next);
   }
+}
+
+
+pcs_poll_result_t
+pcs_poll(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock)
+{
+  if(max_bytes < MAX_HEADER_LEN || pthread_mutex_trylock(&pi->pi_mutex)) {
+    return (pcs_poll_result_t){};
+  }
+  pcs_poll_result_t ppr = pcs_proc(pi, buf, max_bytes, clock, NULL);
   pthread_mutex_unlock(&pi->pi_mutex);
-  if(nextp)
-    *nextp = next;
-  return (pcs_poll_result_t){};
+  return ppr;
+}
+
+
+pcs_poll_result_t
+pcs_wait(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
+         int64_t (*wait)(pthread_cond_t *c,
+                         pthread_mutex_t *m,
+                         int64_t deadline))
+{
+  assert(max_bytes >= MAX_HEADER_LEN);
+  pthread_mutex_lock(&pi->pi_mutex);
+  pcs_poll_result_t ppr = pcs_proc(pi, buf, max_bytes, clock, wait);
+  pthread_mutex_unlock(&pi->pi_mutex);
+  return ppr;
 }
 
 pcs_iface_t *
-pcs_iface_create(void *opaque,
+pcs_iface_create(void *opaque, int fifo_size,
                  int (*accept)(void *opaque, pcs_t *pcs,
-                               uint8_t channel),
-                 void (*wakeup)(void *opaque))
+                               uint8_t channel))
 {
   pcs_iface_t *pi = malloc(sizeof(pcs_iface_t));
   TAILQ_INIT(&pi->pi_pcss);
   pi->pi_opaque = opaque;
   pi->pi_accept = accept;
-  pi->pi_wakeup = wakeup;
+  pi->pi_fifo_size = fifo_size;
   pthread_mutex_init(&pi->pi_mutex, NULL);
+  pthread_cond_init(&pi->pi_cond, NULL);
   return pi;
 }
