@@ -582,7 +582,9 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
 
       next = MIN(next, pcs->last_input + 5000000);
       if(clock > pcs->last_input + 5000000) {
-        if(pcs->state == PCS_STATE_CLOSED) {
+        if(pcs->state == PCS_STATE_CLOSED ||
+           pcs->state == PCS_STATE_SYN ||
+           pcs->state == PCS_STATE_SYNACK) {
           pcs->state = PCS_STATE_LINGER;
         } else {
           pcs->state = PCS_STATE_ERR;
