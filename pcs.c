@@ -184,7 +184,11 @@ pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
 static void
 accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
 {
-  if(seq != pcs->rxfifo_wrptr) {
+  int16_t seq_delta = seq - pcs->rxfifo_wrptr;
+  if(seq_delta < 0) {
+    return; // Old data, just ignore
+  }
+  if(seq_delta > 0) {
     // Got data which does not point to our fifo buffers start,
     pcs->pending_send_flags |= (PCS_F_LOSS | PCS_F_ACK);
     return;
