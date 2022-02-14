@@ -34,6 +34,7 @@ struct pcs_iface {
 #define PCS_F_EOS   0x4
 #define PCS_F_IAK   0x8  // Request Immediate ACK
 #define PCS_F_ACK   0x10
+#define PCS_F_PUSH  0x20
 
 struct pcs {
   int64_t last_output;
@@ -134,8 +135,8 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
 }
 
 
-void
-pcs_flush(pcs_t *pcs)
+static void
+pcs_wakeup(pcs_t *pcs)
 {
   pcs_iface_t *pi = pcs->iface;
   pthread_cond_signal(&pi->pi_cond);
@@ -176,7 +177,7 @@ pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
   TAILQ_INSERT_HEAD(&pi->pi_pcss, pcs, link);
   pcs->last_input = now;
   pcs->rtx = 50000;
-  pcs_flush(pcs);
+  pcs_wakeup(pcs);
   return pcs;
 }
 
@@ -217,7 +218,7 @@ pcs_shutdown_locked(pcs_t *pcs)
 {
   pcs->txfifo_eos = pcs->txfifo_wrptr;
   pcs->pending_send_flags |= PCS_F_EOS;
-  pcs_flush(pcs);
+  pcs_wakeup(pcs);
 }
 
 
@@ -273,7 +274,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
       return;
     pcs->flow = flow;
     pcs->rxfifo_wrptr = pcs->rxfifo_rdptr = (data[0] << 8) | data[1];
-    pcs_flush(pcs);
+    pcs_wakeup(pcs);
     return;
   }
 
@@ -291,7 +292,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     pcs->rxfifo_wrptr = pcs->rxfifo_rdptr = (data[0] << 8) | data[1];
     pcs->state = PCS_STATE_EST;
     pcs->last_output = 0;
-    pcs_flush(pcs);
+    pcs_wakeup(pcs);
     break;
 
   case PCS_STATE_SYNACK:
@@ -302,7 +303,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     }
     pcs->state = PCS_STATE_EST;
     pcs->last_output = 0;
-    pcs_flush(pcs);
+    pcs_wakeup(pcs);
     break;
 
   case PCS_STATE_CLOSED:
@@ -318,7 +319,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
   case PCS_STATE_LINGER:
     pcs->last_output = 0;
-    pcs_flush(pcs);
+    pcs_wakeup(pcs);
     return;
 
   case PCS_STATE_ERR:
@@ -354,7 +355,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
     if(in_flags & PCS_F_IAK) {
       pcs->pending_send_flags |= PCS_F_ACK;
-      pcs_flush(pcs);
+      pcs_wakeup(pcs);
     }
 
     if(in_flags & PCS_F_EOS) {
@@ -395,7 +396,7 @@ pcs_send(pcs_t *pcs, const void *data, size_t len)
     }
     uint16_t avail = pcs->txfifo_size - (pcs->txfifo_wrptr - pcs->txfifo_acked);
     if(avail == 0) {
-      pcs_flush(pcs);
+      pcs_wakeup(pcs);
       pthread_cond_wait(&pcs->txfifo_cond, &pi->pi_mutex);
       continue;
     }
@@ -418,7 +419,15 @@ pcs_send(pcs_t *pcs, const void *data, size_t len)
 }
 
 
-
+void
+pcs_flush(pcs_t *pcs)
+{
+  pcs_iface_t *pi = pcs->iface;
+  pthread_mutex_lock(&pi->pi_mutex);
+  pcs->pending_send_flags |= PCS_F_PUSH;
+  pcs_wakeup(pcs);
+  pthread_mutex_unlock(&pi->pi_mutex);
+}
 
 
 void
@@ -549,7 +558,17 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
           pcs->pending_send_flags |= PCS_F_IAK;
         }
 
-        if(pcs->txfifo_sent != pcs->txfifo_wrptr) {
+        uint16_t unsent = pcs->txfifo_wrptr - pcs->txfifo_sent;
+
+        if(pcs->pending_send_flags & PCS_F_PUSH) {
+          if(unsent == 0) {
+            pcs->pending_send_flags &= ~PCS_F_PUSH;
+          }
+          break;
+        }
+
+
+        if((unsent > pcs->txfifo_size / 4)) {
           break;
         }
 
