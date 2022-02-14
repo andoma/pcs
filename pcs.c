@@ -27,14 +27,15 @@ struct pcs_iface {
 #define PCS_STATE_ERR    3   // Remote have timed out
 #define PCS_STATE_LINGER 4
 #define PCS_STATE_SYN    5
-#define PCS_STATE_SYNACK 6
+#define PCS_STATE_SYN2   6
 
 #define PCS_F_SYN   0x1
-#define PCS_F_LOSS  0x2
+#define PCS_F_SYN2  0x2
 #define PCS_F_EOS   0x4
-#define PCS_F_IAK   0x8  // Request Immediate ACK
-#define PCS_F_ACK   0x10
-#define PCS_F_PUSH  0x20
+#define PCS_F_LOSS  0x8
+#define PCS_F_PUSH  0x10
+#define PCS_F_IAK   0x20
+
 
 struct pcs {
   int64_t last_output;
@@ -53,6 +54,8 @@ struct pcs {
   uint8_t flow;
   uint8_t pending_send_flags;
   uint8_t tentative_flows;
+  uint8_t ack_req;
+  uint8_t reflow;
 
   uint16_t transport_addr;
 
@@ -82,13 +85,17 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
 
   uint8_t flags = pcs->pending_send_flags;
 
-  pcs->pending_send_flags &= ~(PCS_F_LOSS | PCS_F_ACK | PCS_F_IAK);
+  pcs->pending_send_flags &= ~(PCS_F_LOSS | PCS_F_IAK);
 
   if(pcs->state == PCS_STATE_SYN) {
-    pcs->flow = rand();
+    if((pcs->reflow & 3) == 0) {
+      pcs->flow = rand();
+    }
     flags |= PCS_F_SYN;
-  } else if(pcs->state == PCS_STATE_SYNACK) {
-    flags |= PCS_F_SYN | PCS_F_ACK;
+    pcs->reflow++;
+
+  } else if(pcs->state == PCS_STATE_SYN2) {
+    flags |= PCS_F_SYN | PCS_F_SYN2;
   }
 
   buf[0] = pcs->channel;
@@ -131,6 +138,12 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
   buf[1] = flags;
 
   pcs->txfifo_sent += payload_len;
+
+  if(pcs->txfifo_sent == pcs->txfifo_wrptr) {
+    pcs->pending_send_flags &= ~PCS_F_PUSH;
+  }
+  pcs->ack_req = 0;
+
   return size;
 }
 
@@ -191,7 +204,7 @@ accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
   }
   if(seq_delta > 0) {
     // Got data which does not point to our fifo buffers start,
-    pcs->pending_send_flags |= (PCS_F_LOSS | PCS_F_ACK);
+    pcs->pending_send_flags |= PCS_F_LOSS;
     return;
   }
 
@@ -228,7 +241,7 @@ half_open_count(const pcs_iface_t *pi)
   const pcs_t *pcs;
   int count = 0;
   TAILQ_FOREACH(pcs, &pi->pi_pcss, link) {
-    if(pcs->state == PCS_STATE_SYNACK ||
+    if(pcs->state == PCS_STATE_SYN2 ||
        pcs->state == PCS_STATE_CLOSED)
       count++;
   }
@@ -258,7 +271,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     }
   }
 
-  if((in_flags & (PCS_F_SYN | PCS_F_ACK)) == PCS_F_SYN) {
+  if((in_flags & (PCS_F_SYN | PCS_F_SYN2)) == PCS_F_SYN) {
     // Got SYN
     if(pcs != NULL) {
       return; // But we already have a connection here, drop this packet
@@ -269,7 +282,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     if(half_open_count(pi) > 1)
       return;
 
-    pcs = pcs_create(pi, channel, pi->pi_fifo_size, now, PCS_STATE_SYNACK, addr);
+    pcs = pcs_create(pi, channel, pi->pi_fifo_size, now, PCS_STATE_SYN2, addr);
     if(pcs == NULL)
       return;
     pcs->flow = flow;
@@ -285,8 +298,9 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
   switch(pcs->state) {
 
   case PCS_STATE_SYN:
-    // We have sent SYN and are waiting for an ACK
-    if(len != 2)
+    // We have sent SYN and are waiting for an SYN2
+    if(len != 2 ||
+       ((in_flags & (PCS_F_SYN | PCS_F_SYN2)) != (PCS_F_SYN | PCS_F_SYN2)))
       return;
 
     pcs->rxfifo_wrptr = pcs->rxfifo_rdptr = (data[0] << 8) | data[1];
@@ -295,7 +309,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     pcs_wakeup(pcs);
     break;
 
-  case PCS_STATE_SYNACK:
+  case PCS_STATE_SYN2:
     if(pi->pi_accept(pi->pi_opaque, pcs, pcs->channel)) {
       pcs_shutdown_locked(pcs);
       pcs->state = PCS_STATE_CLOSED;
@@ -334,14 +348,22 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
 
     const uint16_t full = pcs->txfifo_wrptr - pcs->txfifo_acked;
     if(full < pcs->txfifo_size / 2) {
+      // We can send more
       pthread_cond_signal(&pcs->txfifo_cond);
     }
 
     if(in_flags & PCS_F_LOSS) {
+      // Peer lost data, rewind our send-point
       pcs->txfifo_sent = ack;
+      pcs->pending_send_flags |= PCS_F_PUSH;
     }
   } else {
     return;
+  }
+
+  if(in_flags & (PCS_F_IAK | PCS_F_PUSH)) {
+    pcs->ack_req |= in_flags & (PCS_F_IAK | PCS_F_PUSH);
+    pcs_wakeup(pcs);
   }
 
   pcs->last_input = now;
@@ -352,11 +374,6 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     data += 2;
     len -= 2;
     accept_data(pcs, data, len, seq);
-
-    if(in_flags & PCS_F_IAK) {
-      pcs->pending_send_flags |= PCS_F_ACK;
-      pcs_wakeup(pcs);
-    }
 
     if(in_flags & PCS_F_EOS) {
       uint16_t the_end = seq + len;
@@ -396,6 +413,7 @@ pcs_send(pcs_t *pcs, const void *data, size_t len)
     }
     uint16_t avail = pcs->txfifo_size - (pcs->txfifo_wrptr - pcs->txfifo_acked);
     if(avail == 0) {
+      pcs->pending_send_flags |= PCS_F_PUSH;
       pcs_wakeup(pcs);
       pthread_cond_wait(&pcs->txfifo_cond, &pi->pi_mutex);
       continue;
@@ -403,7 +421,7 @@ pcs_send(pcs_t *pcs, const void *data, size_t len)
 
     const uint16_t mask = pcs->txfifo_size - 1;
     const int to_copy = MIN(avail, len);
-    assert(to_copy > 0 && to_copy < pcs->txfifo_size);
+    assert(to_copy > 0 && to_copy <= pcs->txfifo_size);
     uint16_t wrptr = pcs->txfifo_wrptr;
     const uint8_t *d = data;
     for(int i = 0; i < to_copy; i++) {
@@ -533,13 +551,14 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
 
     pcs_t *pcs, *n;
     for(pcs = TAILQ_FIRST(&pi->pi_pcss); pcs != NULL; pcs = n) {
+      const uint16_t unsent = pcs->txfifo_wrptr - pcs->txfifo_sent;
+      const uint16_t unacked = pcs->txfifo_sent - pcs->txfifo_acked;
 
       n = TAILQ_NEXT(pcs, link);
       switch(pcs->state) {
       case PCS_STATE_SYN:
-      case PCS_STATE_SYNACK:
+      case PCS_STATE_SYN2:
         if(clock > pcs->last_output + pcs->rtx) {
-          pcs->pending_send_flags |= PCS_F_IAK;
           pcs_backoff(pcs);
           break;
         }
@@ -549,41 +568,53 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
       case PCS_STATE_EST:
       case PCS_STATE_FIN:
       case PCS_STATE_CLOSED:
-        if(clock > pcs->last_output + 1500000)
-          break;
 
-        next = MIN(next, pcs->last_output + 1500000);
-        uint16_t unacked = pcs->txfifo_sent - pcs->txfifo_acked;
-        if(unacked) {
-          pcs->pending_send_flags |= PCS_F_IAK;
+        // If peer wants an immediate ACK, send
+        if(pcs->ack_req) {
+
+          if(pcs->ack_req & PCS_F_IAK) {
+            break;
+          } else {
+            if(clock > pcs->last_input + pcs->rtx / 2) {
+              break;
+            }
+            next = MIN(next, pcs->last_input + pcs->rtx / 2);
+          }
         }
-
-        uint16_t unsent = pcs->txfifo_wrptr - pcs->txfifo_sent;
 
         if(pcs->pending_send_flags & PCS_F_PUSH) {
-          if(unsent == 0) {
-            pcs->pending_send_flags &= ~PCS_F_PUSH;
+          if(clock > pcs->last_output + pcs->rtx / 2) {
+            break;
           }
-          break;
+          next = MIN(next, pcs->last_output + pcs->rtx / 2);
         }
 
 
-        if((unsent > pcs->txfifo_size / 4)) {
-          break;
-        }
-
-        if(pcs->pending_send_flags & PCS_F_ACK) {
+        if((unsent > pcs->txfifo_size / 2)) {
+          pcs->pending_send_flags |= PCS_F_IAK;
           break;
         }
 
         if(unacked || (pcs->pending_send_flags & PCS_F_EOS)) {
-
           if(clock > pcs->last_output + pcs->rtx) {
+            pcs->pending_send_flags |= PCS_F_IAK;
             pcs_backoff(pcs);
             break;
           }
           next = MIN(next, pcs->last_output + pcs->rtx);
         }
+
+        int remote_is_silent = clock > pcs->last_input + 1500000;
+
+        int ka_interval = remote_is_silent ? 250000 : 1100000;
+
+        if(clock > pcs->last_output + ka_interval) {
+          if(remote_is_silent) {
+            pcs->pending_send_flags |= PCS_F_IAK;
+          }
+          break;
+        }
+        next = MIN(next, pcs->last_output + ka_interval);
         continue;
 
       case PCS_STATE_ERR:
@@ -602,7 +633,7 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
       next = MIN(next, pcs->last_input + 5000000);
       if(clock > pcs->last_input + 5000000) {
         if(pcs->state == PCS_STATE_CLOSED ||
-           pcs->state == PCS_STATE_SYNACK) {
+           pcs->state == PCS_STATE_SYN2) {
           pcs->state = PCS_STATE_LINGER;
         } else {
           pcs->state = PCS_STATE_ERR;
