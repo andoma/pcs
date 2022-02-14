@@ -625,6 +625,7 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
           pcs_destroy(pi, pcs);
           continue;
         }
+        next = MIN(next, pcs->last_input + 5000000);
         if(pcs->last_output)
           continue;
         break;
