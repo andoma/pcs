@@ -91,6 +91,16 @@ send_to_pcs_thread(void *arg)
 
     int64_t ts = get_ts();
     pcs_send(pcs, buf, r);
+
+    if(r > 0) {
+      for(int i = 0; i < r; i++) {
+        if(buf[i] == 10) {
+          pcs_flush(pcs);
+          break;
+        }
+      }
+    }
+
     if(g_do_timings) {
       ts = get_ts() - ts;
       fprintf(stderr, "XMIT %d took %d\n", r, (int)ts);
