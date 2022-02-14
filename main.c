@@ -14,6 +14,7 @@
 
 static int g_fd;
 
+static int g_do_echo;
 static int g_do_hexdump;
 static int g_do_timings;
 static float g_drop;
@@ -128,6 +129,11 @@ read_from_pcs_thread(void *arg)
       if(write(1, buf, len) != len) {
         break;
       }
+
+      if(g_do_echo) {
+        pcs_send(pcs, buf, len);
+        pcs_flush(pcs);
+      }
     }
   }
 
@@ -239,7 +245,7 @@ main(int argc, char **argv)
   int poll_interval = 0;
   int do_connect = 0;
 
-  while((opt = getopt(argc, argv, "l:r:cxtd:p:")) != -1) {
+  while((opt = getopt(argc, argv, "l:r:cxtd:p:e")) != -1) {
     switch(opt) {
     case 'l':
       local_port = atoi(optarg);
@@ -268,6 +274,9 @@ main(int argc, char **argv)
       break;
     case 'p':
       poll_interval = atoi(argv[1]);
+      break;
+    case 'e':
+      g_do_echo = 1;
       break;
     }
   }
