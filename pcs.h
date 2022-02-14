@@ -44,4 +44,7 @@ pcs_iface_t *pcs_iface_create(void *opaque, int fifo_size,
                                             uint8_t channel));
 
 
+void *pcs_malloc(size_t size);
+
+
 

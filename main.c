@@ -89,7 +89,7 @@ send_to_pcs_thread(void *arg)
       break;
 
     int64_t ts = get_ts();
-    pcs_send(pcs, buf, r, 1);
+    pcs_send(pcs, buf, r);
     if(g_do_timings) {
       ts = get_ts() - ts;
       fprintf(stderr, "XMIT %d took %d\n", r, (int)ts);
@@ -117,7 +117,7 @@ read_from_pcs_thread(void *arg)
   while(1) {
     char buf[128];
 
-    int len = pcs_read(pcs, buf, sizeof(buf), 0);
+    int len = pcs_read(pcs, buf, sizeof(buf), 1);
     if(len == 0) {
       fprintf(stderr, "* Remote end closed connection\n");
       break;
@@ -141,21 +141,22 @@ read_from_pcs_thread(void *arg)
   return NULL;
 }
 
-void *
-pcs_accept(pcs_t *pcs, uint8_t channel)
+
+static int
+pcs_accept(void *opaque, pcs_t *pcs, uint8_t channel)
 {
   pthread_t tid;
   fprintf(stderr, "* Accepted connection on channel %d\n", channel);
   pthread_create(&tid, NULL, read_from_pcs_thread, pcs);
-  return NULL;
+  return 0;
 }
-
 
 
 
 static void *
 read_from_network_thread(void *arg)
 {
+  pcs_iface_t *pi = arg;
   uint8_t buf[4096];
 
   while(1) {
@@ -168,7 +169,7 @@ read_from_network_thread(void *arg)
 
       if(g_do_hexdump)
         hexdump(" IN", buf, r);
-      pcs_input(buf, r, get_ts());
+      pcs_input(pi, buf, r, get_ts(), 100);
     }
   }
   return NULL;
@@ -176,15 +177,51 @@ read_from_network_thread(void *arg)
 
 
 static void
-dopoll(void)
+dopoll(pcs_iface_t *pi)
 {
   uint8_t buf[127];
 
-  size_t r = pcs_poll(buf, sizeof(buf), get_ts());
-  if(r) {
+  pcs_poll_result_t ppr = pcs_poll(pi, buf, sizeof(buf), get_ts());
+  if(ppr.len) {
     if(g_do_hexdump)
-      hexdump("OUT", buf, r);
-    send(g_fd, buf, r, 0);
+      hexdump("OUT", buf, ppr.len);
+    send(g_fd, buf, ppr.len, 0);
+  }
+}
+
+
+static struct timespec
+usec_to_timespec(uint64_t ts)
+{
+  return (struct timespec){.tv_sec = ts / 1000000LL,
+                           .tv_nsec = (ts % 1000000LL) * 1000};
+}
+
+
+static int64_t
+wait_helper(pthread_cond_t *c, pthread_mutex_t *m, int64_t deadline)
+{
+  if(deadline == INT64_MAX) {
+    pthread_cond_wait(c, m);
+  } else {
+    struct timespec ts = usec_to_timespec(deadline);
+    pthread_cond_timedwait(c, m, &ts);
+  }
+  return get_ts();
+}
+
+
+static void
+dowait(pcs_iface_t *pi)
+{
+  uint8_t buf[127];
+
+  pcs_poll_result_t ppr = pcs_wait(pi, buf, sizeof(buf), get_ts(),
+                                   wait_helper);
+  if(ppr.len) {
+    if(g_do_hexdump)
+      hexdump("OUT", buf, ppr.len);
+    send(g_fd, buf, ppr.len, 0);
   }
 }
 
@@ -198,9 +235,11 @@ main(int argc, char **argv)
   int local_port = 0;
   int remote_port = 0;
   char *remote_host = NULL;
-
+  int fifo_size = 128;
+  int poll_interval = 0;
   int do_connect = 0;
-  while((opt = getopt(argc, argv, "l:r:cxtd:")) != -1) {
+
+  while((opt = getopt(argc, argv, "l:r:cxtd:p:")) != -1) {
     switch(opt) {
     case 'l':
       local_port = atoi(optarg);
@@ -227,8 +266,12 @@ main(int argc, char **argv)
     case 'd':
       g_drop = atoi(optarg) / 100.0f;
       break;
+    case 'p':
+      poll_interval = atoi(argv[1]);
+      break;
     }
   }
+
 
   if(remote_port == 0) {
     fprintf(stderr, "remote port not set\n");
@@ -268,15 +311,24 @@ main(int argc, char **argv)
 
   g_fd = fd;
 
+  pcs_iface_t *pi = pcs_iface_create(NULL, fifo_size, pcs_accept);
+
   if(do_connect) {
-    pcs_t *pcs = pcs_connect(0, get_ts());
+    pcs_t *pcs = pcs_connect(pi, 0, get_ts(), 11);
     pthread_create(&tid, NULL, read_from_pcs_thread, pcs);
   }
 
-  pthread_create(&tid, NULL, read_from_network_thread, NULL);
+  pthread_create(&tid, NULL, read_from_network_thread, pi);
 
-  while(1) {
-    usleep(10000);
-    dopoll();
+  if(poll_interval) {
+    while(1) {
+      usleep(poll_interval);
+      dopoll(pi);
+    }
+  } else {
+
+    while(1) {
+      dowait(pi);
+    }
   }
 }
