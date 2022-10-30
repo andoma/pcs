@@ -689,7 +689,8 @@ pcs_wait(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
 pcs_iface_t *
 pcs_iface_create(void *opaque, int fifo_size,
                  int (*accept)(void *opaque, pcs_t *pcs,
-                               uint8_t channel))
+                               uint8_t channel),
+                 const pthread_condattr_t *pca)
 {
   pcs_iface_t *pi = malloc(sizeof(pcs_iface_t));
   TAILQ_INIT(&pi->pi_pcss);
@@ -697,6 +698,6 @@ pcs_iface_create(void *opaque, int fifo_size,
   pi->pi_accept = accept;
   pi->pi_fifo_size = fifo_size;
   pthread_mutex_init(&pi->pi_mutex, NULL);
-  pthread_cond_init(&pi->pi_cond, NULL);
+  pthread_cond_init(&pi->pi_cond, pca);
   return pi;
 }

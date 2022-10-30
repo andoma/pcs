@@ -41,7 +41,9 @@ pcs_poll_result_t pcs_wait(pcs_iface_t *pi, uint8_t *buf,
 
 pcs_iface_t *pcs_iface_create(void *opaque, int fifo_size,
                               int (*accept)(void *opaque, pcs_t *pcs,
-                                            uint8_t channel));
+                                            uint8_t channel),
+                              const pthread_condattr_t *pca);
+
 
 
 void *pcs_malloc(size_t size);
