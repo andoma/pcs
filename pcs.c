@@ -16,8 +16,8 @@ struct pcs_iface {
   pthread_mutex_t pi_mutex;
   struct pcs_queue pi_pcss;
   void *pi_opaque;
+  pcs_fifo_sizes_t (*pi_fifo_size)(void *opauqe, uint8_t channel);
   int (*pi_accept)(void *opauqe, pcs_t *pcs, uint8_t channel);
-  int pi_fifo_size;
   pthread_cond_t pi_cond;
 };
 
@@ -42,6 +42,9 @@ struct pcs {
   int64_t last_input;
   pcs_iface_t *iface;
   void *arg;
+  void (*fill)(void *arg, size_t avail,
+               void (*write)(pcs_t *pcs, const void *buf, size_t len));
+
   TAILQ_ENTRY(pcs) link;
 
   pthread_cond_t txfifo_cond;
@@ -148,6 +151,13 @@ pcs_xmit(pcs_t *pcs, uint8_t *buf, size_t max_bytes)
 }
 
 
+void
+pcs_iface_wakeup(pcs_iface_t *pi)
+{
+  pthread_cond_signal(&pi->pi_cond);
+}
+
+
 static void
 pcs_wakeup(pcs_t *pcs)
 {
@@ -164,19 +174,25 @@ void *pcs_malloc(size_t size)
 
 
 static pcs_t *
-pcs_create(pcs_iface_t *pi, uint8_t channel, size_t fifo_size, int64_t now,
+pcs_create(pcs_iface_t *pi, uint8_t channel, int64_t now,
            int state, uint16_t transport_addr)
 {
-  pcs_t *pcs = pcs_malloc(sizeof(pcs_t) + fifo_size * 2);
+  pcs_fifo_sizes_t siz = pi->pi_fifo_size(pi->pi_opaque, channel);
+
+  if(siz.tx == 0 && siz.rx == 0)
+    return NULL;
+
+  pcs_t *pcs = pcs_malloc(sizeof(pcs_t) + siz.tx + siz.rx);
   if(pcs == NULL)
     return NULL;
+
 
   memset(pcs, 0, sizeof(pcs_t));
   pcs->iface = pi;
   pcs->channel = channel;
   pcs->transport_addr = transport_addr;
-  pcs->txfifo_size = fifo_size;
-  pcs->rxfifo_size = fifo_size;
+  pcs->txfifo_size = siz.tx;
+  pcs->rxfifo_size = siz.rx;
 
   uint16_t seq = rand();
   pcs->txfifo_acked = seq;
@@ -208,7 +224,7 @@ accept_data(pcs_t *pcs, const uint8_t *data, int len, uint16_t seq)
     return;
   }
 
-  if(len == 0)
+  if(len == 0 || pcs->rxfifo_size == 0)
     return;
 
   uint16_t avail = pcs->rxfifo_size - (pcs->rxfifo_wrptr - pcs->rxfifo_rdptr);
@@ -282,7 +298,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     if(half_open_count(pi) > 1)
       return;
 
-    pcs = pcs_create(pi, channel, pi->pi_fifo_size, now, PCS_STATE_SYN2, addr);
+    pcs = pcs_create(pi, channel, now, PCS_STATE_SYN2, addr);
     if(pcs == NULL)
       return;
     pcs->flow = flow;
@@ -349,7 +365,7 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
     const uint16_t full = pcs->txfifo_wrptr - pcs->txfifo_acked;
     if(full < pcs->txfifo_size / 2) {
       // We can send more
-      pthread_cond_signal(&pcs->txfifo_cond);
+      pthread_cond_signal(pcs->fill ? &pcs->iface->pi_cond : &pcs->txfifo_cond);
     }
 
     if(in_flags & PCS_F_LOSS) {
@@ -379,7 +395,13 @@ pcs_input_locked(pcs_iface_t *pi, const uint8_t *data, size_t len, int64_t now,
       uint16_t the_end = seq + len;
       if(pcs->rxfifo_wrptr == the_end) {
         assert(pcs->state <= PCS_STATE_FIN);
-        pcs->state = PCS_STATE_FIN;
+        if(pcs->fill) {
+          pcs->fill(pcs->arg, 0, NULL);
+          pcs->fill = NULL;
+          pcs->state = PCS_STATE_CLOSED;
+        } else {
+          pcs->state = PCS_STATE_FIN;
+        }
         pthread_cond_signal(&pcs->rxfifo_cond);
       }
     }
@@ -437,6 +459,32 @@ pcs_send(pcs_t *pcs, const void *data, size_t len)
 }
 
 
+static void
+send_locked(pcs_t *pcs, const void *data, size_t len)
+{
+  if(data == NULL) {
+    pcs->pending_send_flags |= PCS_F_PUSH;
+    return;
+  }
+
+  uint8_t *txfifo = pcs->buffers + pcs->rxfifo_size;
+
+  uint16_t avail = pcs->txfifo_size - (pcs->txfifo_wrptr - pcs->txfifo_acked);
+  assert(avail >= len);
+
+  const uint16_t mask = pcs->txfifo_size - 1;
+  const int to_copy = MIN(avail, len);
+  assert(to_copy > 0 && to_copy <= pcs->txfifo_size);
+  uint16_t wrptr = pcs->txfifo_wrptr;
+  const uint8_t *d = data;
+  for(int i = 0; i < to_copy; i++) {
+    txfifo[wrptr++ & mask] = d[i];
+  }
+
+  pcs->txfifo_wrptr = wrptr;
+}
+
+
 void
 pcs_flush(pcs_t *pcs)
 {
@@ -472,7 +520,7 @@ pcs_t *
 pcs_connect(pcs_iface_t *pi, uint8_t channel, int64_t now, uint16_t addr)
 {
   pthread_mutex_lock(&pi->pi_mutex);
-  pcs_t *pcs = pcs_create(pi, channel, 64, now, PCS_STATE_SYN, addr);
+  pcs_t *pcs = pcs_create(pi, channel, now, PCS_STATE_SYN, addr);
   pthread_mutex_unlock(&pi->pi_mutex);
   return pcs;
 }
@@ -485,6 +533,9 @@ pcs_read(pcs_t *pcs, void *data, size_t len, size_t req)
   uint8_t *d = data;
   int total = 0;
   uint8_t *rxfifo = pcs->buffers;
+
+  if(pcs->rxfifo_size == 0)
+    return 0;
 
   pthread_mutex_lock(&pi->pi_mutex);
 
@@ -535,6 +586,7 @@ static void
 pcs_destroy(pcs_iface_t *pi, pcs_t *pcs)
 {
   TAILQ_REMOVE(&pi->pi_pcss, pcs, link);
+  assert(pcs->fill == NULL);
   free(pcs);
 }
 
@@ -551,6 +603,15 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
 
     pcs_t *pcs, *n;
     for(pcs = TAILQ_FIRST(&pi->pi_pcss); pcs != NULL; pcs = n) {
+
+      if(pcs->fill && pcs->state == PCS_STATE_EST) {
+        const uint16_t avail =
+          pcs->txfifo_size - (pcs->txfifo_wrptr - pcs->txfifo_acked);
+        if(avail > 0) {
+          pcs->fill(pcs->arg, avail, send_locked);
+        }
+      }
+
       const uint16_t unsent = pcs->txfifo_wrptr - pcs->txfifo_sent;
       const uint16_t unacked = pcs->txfifo_sent - pcs->txfifo_acked;
 
@@ -637,7 +698,13 @@ pcs_proc(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
            pcs->state == PCS_STATE_SYN2) {
           pcs->state = PCS_STATE_LINGER;
         } else {
-          pcs->state = PCS_STATE_ERR;
+          if(pcs->fill) {
+            pcs->fill(pcs->arg, 0, NULL);
+            pcs->fill = NULL;
+            pcs->state = PCS_STATE_CLOSED;
+          } else {
+            pcs->state = PCS_STATE_ERR;
+          }
         }
         pthread_cond_signal(&pcs->rxfifo_cond);
         pthread_cond_signal(&pcs->txfifo_cond);
@@ -687,7 +754,9 @@ pcs_wait(pcs_iface_t *pi, uint8_t *buf, size_t max_bytes, int64_t clock,
 }
 
 pcs_iface_t *
-pcs_iface_create(void *opaque, int fifo_size,
+pcs_iface_create(void *opaque,
+                 pcs_fifo_sizes_t (*fifo_size)(void *opaque,
+                                               uint8_t channel),
                  int (*accept)(void *opaque, pcs_t *pcs,
                                uint8_t channel),
                  const pthread_condattr_t *pca)
@@ -695,9 +764,25 @@ pcs_iface_create(void *opaque, int fifo_size,
   pcs_iface_t *pi = malloc(sizeof(pcs_iface_t));
   TAILQ_INIT(&pi->pi_pcss);
   pi->pi_opaque = opaque;
-  pi->pi_accept = accept;
   pi->pi_fifo_size = fifo_size;
+  pi->pi_accept = accept;
   pthread_mutex_init(&pi->pi_mutex, NULL);
   pthread_cond_init(&pi->pi_cond, pca);
   return pi;
+}
+
+pcs_iface_t *
+pcs_get_iface(pcs_t *pcs)
+{
+  return pcs->iface;
+}
+
+void pcs_callback(pcs_t *pcs, void *arg,
+                  void (*fill)(void *arg, size_t avail,
+                               void (*write)(pcs_t *pcs,
+                                            const void *buf,
+                                            size_t len)))
+{
+  pcs->arg = arg;
+  pcs->fill = fill;
 }
